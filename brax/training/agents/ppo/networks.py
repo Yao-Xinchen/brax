@@ -70,9 +70,11 @@ def make_ppo_networks(
     preprocess_observations_fn: types.PreprocessObservationFn = types.identity_observation_preprocessor,
     policy_hidden_layer_sizes: Sequence[int] = (32,) * 4,
     value_hidden_layer_sizes: Sequence[int] = (256,) * 5,
+    encoder_hidden_layer_sizes: Sequence[int] = (),
     activation: networks.ActivationFn = linen.swish,
     policy_obs_key: str = 'state',
     value_obs_key: str = 'state',
+    encoder_obs_key: str = 'state_history',
     distribution_type: Literal['normal', 'tanh_normal'] = 'tanh_normal',
     noise_std_type: Literal['scalar', 'log'] = 'scalar',
     init_noise_std: float = 1.0,
@@ -104,6 +106,8 @@ def make_ppo_networks(
       noise_std_type=noise_std_type,
       init_noise_std=init_noise_std,
       state_dependent_std=state_dependent_std,
+      encoder_hidden_layer_sizes=encoder_hidden_layer_sizes,
+      encoder_obs_key=encoder_obs_key,
   )
   value_network = networks.make_value_network(
       observation_size,

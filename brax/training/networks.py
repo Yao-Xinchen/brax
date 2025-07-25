@@ -106,6 +106,42 @@ class MLP(linen.Module):
     return hidden
 
 
+class EMLP(linen.Module):
+  """MLP with encoder for observation history."""
+
+  layer_sizes: Sequence[int]
+  encoder_layer_sizes: Sequence[int]
+  activation: ActivationFn = linen.relu
+  kernel_init: Initializer = jax.nn.initializers.lecun_uniform()
+  activate_final: bool = False
+  bias: bool = True
+  layer_norm: bool = False
+
+  @linen.compact
+  def __call__(self, obs: jnp.ndarray, obs_history: jnp.ndarray):
+    if self.encoder_layer_sizes:
+      encoded_history = MLP(
+          layer_sizes=list(self.encoder_layer_sizes),
+          activation=self.activation,
+          kernel_init=self.kernel_init,
+          activate_final=True,
+          bias=self.bias,
+          layer_norm=self.layer_norm,
+      )(obs_history)
+      combined_input = jnp.concatenate([obs, encoded_history], axis=-1)
+    else:
+      combined_input = obs
+    
+    return MLP(
+        layer_sizes=self.layer_sizes,
+        activation=self.activation,
+        kernel_init=self.kernel_init,
+        activate_final=self.activate_final,
+        bias=self.bias,
+        layer_norm=self.layer_norm,
+    )(combined_input)
+
+
 class SNMLP(linen.Module):
   """MLP module with Spectral Normalization."""
 
@@ -321,16 +357,32 @@ def make_policy_network(
     noise_std_type: Literal['scalar', 'log'] = 'scalar',
     init_noise_std: float = 1.0,
     state_dependent_std: bool = False,
+    encoder_hidden_layer_sizes: Sequence[int] = (),
+    encoder_obs_key: str = 'state_history',
 ) -> FeedForwardNetwork:
   """Creates a policy network."""
   if distribution_type == 'tanh_normal':
-    policy_module = MLP(
-        layer_sizes=list(hidden_layer_sizes) + [param_size],
-        activation=activation,
-        kernel_init=kernel_init,
-        layer_norm=layer_norm,
-    )
+    if encoder_hidden_layer_sizes:
+      policy_module = EMLP(
+          layer_sizes=list(hidden_layer_sizes) + [param_size],
+          encoder_layer_sizes=encoder_hidden_layer_sizes,
+          activation=activation,
+          kernel_init=kernel_init,
+          layer_norm=layer_norm,
+      )
+    else:
+      policy_module = MLP(
+          layer_sizes=list(hidden_layer_sizes) + [param_size],
+          activation=activation,
+          kernel_init=kernel_init,
+          layer_norm=layer_norm,
+      )
   elif distribution_type == 'normal':
+    if encoder_hidden_layer_sizes:
+      raise NotImplementedError(
+          'Encoder not yet implemented for normal distribution. '
+          'Use tanh_normal distribution instead.'
+      )
     policy_module = PolicyModuleWithStd(
         param_size=param_size,
         hidden_layer_sizes=hidden_layer_sizes,
@@ -348,20 +400,71 @@ def make_policy_network(
     )
 
   def apply(processor_params, policy_params, obs):
-    if isinstance(obs, Mapping):
-      obs = preprocess_observations_fn(
-          obs[obs_key], normalizer_select(processor_params, obs_key)
-      )
+    if encoder_hidden_layer_sizes:
+      # For EMLP, extract and process both obs and encoder_obs
+      if isinstance(obs, Mapping):
+        # Process main observation
+        main_obs = preprocess_observations_fn(
+            obs[obs_key], normalizer_select(processor_params, obs_key)
+        )
+        
+        # Process encoder observation if present
+        if encoder_obs_key in obs:
+          encoder_obs = preprocess_observations_fn(
+              obs[encoder_obs_key], normalizer_select(processor_params, encoder_obs_key)
+          )
+        else:
+          # No encoder obs available, create zeros with proper size
+          if isinstance(obs_size, Mapping) and encoder_obs_key in obs_size:
+            encoder_obs_size = _get_obs_state_size(obs_size, encoder_obs_key)
+            encoder_obs = jnp.zeros(main_obs.shape[:-1] + (encoder_obs_size,))
+          else:
+            # Fallback: use same size as main obs
+            encoder_obs = jnp.zeros_like(main_obs)
+        
+        return policy_module.apply(policy_params, main_obs, encoder_obs)
+      else:
+        # Array input (backward compatibility) - split array
+        obs_processed = preprocess_observations_fn(obs, processor_params)
+        # For backward compatibility, assume first part is obs, rest is encoder_obs
+        # This is a fallback - dictionary input is preferred
+        obs_size_val = _get_obs_state_size(obs_size, obs_key)
+        main_obs = obs_processed[..., :obs_size_val]
+        encoder_obs = obs_processed[..., obs_size_val:]
+        return policy_module.apply(policy_params, main_obs, encoder_obs)
     else:
-      obs = preprocess_observations_fn(obs, processor_params)
-    return policy_module.apply(policy_params, obs)
+      # For regular MLP, use original logic
+      if isinstance(obs, Mapping):
+        obs = preprocess_observations_fn(
+            obs[obs_key], normalizer_select(processor_params, obs_key)
+        )
+      else:
+        obs = preprocess_observations_fn(obs, processor_params)
+      return policy_module.apply(policy_params, obs)
 
-  obs_size = _get_obs_state_size(obs_size, obs_key)
-  dummy_obs = jnp.zeros((1, obs_size))
-
-  def init(key):
-    policy_module_params = policy_module.init(key, dummy_obs)
-    return policy_module_params
+  if encoder_hidden_layer_sizes:
+    # For EMLP, create two dummy observations
+    obs_size_val = _get_obs_state_size(obs_size, obs_key)
+    dummy_obs = jnp.zeros((1, obs_size_val))
+    
+    if isinstance(obs_size, Mapping) and encoder_obs_key in obs_size:
+      encoder_obs_size = _get_obs_state_size(obs_size, encoder_obs_key)
+      dummy_encoder_obs = jnp.zeros((1, encoder_obs_size))
+    else:
+      # Fallback: assume same size as main obs
+      dummy_encoder_obs = jnp.zeros((1, obs_size_val))
+    
+    def init(key):
+      policy_module_params = policy_module.init(key, dummy_obs, dummy_encoder_obs)
+      return policy_module_params
+  else:
+    # For regular MLP
+    obs_size_val = _get_obs_state_size(obs_size, obs_key)
+    dummy_obs = jnp.zeros((1, obs_size_val))
+    
+    def init(key):
+      policy_module_params = policy_module.init(key, dummy_obs)
+      return policy_module_params
 
   return FeedForwardNetwork(init=init, apply=apply)
 
