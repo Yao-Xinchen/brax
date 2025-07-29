@@ -28,6 +28,8 @@ from flax import linen
 class TSNetworks:
   policy_network: networks.FeedForwardNetwork
   value_network: networks.FeedForwardNetwork
+  teacher_network: networks.FeedForwardNetwork
+  student_network: networks.FeedForwardNetwork
   parametric_action_distribution: distribution.ParametricDistribution
 
 
@@ -67,12 +69,16 @@ def make_inference_fn(ts_networks: TSNetworks):
 def make_ts_networks(
     observation_size: types.ObservationSize,
     action_size: int,
+    latent_size: int,
     preprocess_observations_fn: types.PreprocessObservationFn = types.identity_observation_preprocessor,
     policy_hidden_layer_sizes: Sequence[int] = (32,) * 4,
     value_hidden_layer_sizes: Sequence[int] = (256,) * 5,
+    teacher_hidden_layer_sizes: Sequence[int] = (32,) * 4,
+    student_hidden_layer_sizes: Sequence[int] = (32,) * 4,
     activation: networks.ActivationFn = linen.swish,
     policy_obs_key: str = 'state',
     value_obs_key: str = 'state',
+    encoder_obs_key: str = 'state_history',
     distribution_type: Literal['normal', 'tanh_normal'] = 'tanh_normal',
     noise_std_type: Literal['scalar', 'log'] = 'scalar',
     init_noise_std: float = 1.0,
@@ -80,11 +86,8 @@ def make_ts_networks(
 ) -> TSNetworks:
   """Make TS networks with preprocessor."""
   parametric_action_distribution: distribution.ParametricDistribution
-  if distribution_type == 'normal':
-    parametric_action_distribution = distribution.NormalDistribution(
-        event_size=action_size
-    )
-  elif distribution_type == 'tanh_normal':
+
+  if distribution_type == 'tanh_normal':
     parametric_action_distribution = distribution.NormalTanhDistribution(
         event_size=action_size
     )
@@ -93,6 +96,28 @@ def make_ts_networks(
         f'Unsupported distribution type: {distribution_type}. Must be one'
         ' of "normal" or "tanh_normal".'
     )
+
+  # The policy observation is the state plus the latent.
+  observation_size[policy_obs_key] += latent_size
+
+  teacher_network = networks.make_encoder_network(
+      latent_size,
+      observation_size,
+      preprocess_observations_fn=preprocess_observations_fn,
+      hidden_layer_sizes=teacher_hidden_layer_sizes,
+      activation=activation,
+      obs_key=value_obs_key,  # privileged state
+  )
+
+  student_network = networks.make_encoder_network(
+      latent_size,
+      observation_size,
+      preprocess_observations_fn=preprocess_observations_fn,
+      hidden_layer_sizes=student_hidden_layer_sizes,
+      activation=activation,
+      obs_key=encoder_obs_key,  # state history
+  )
+
   policy_network = networks.make_policy_network(
       parametric_action_distribution.param_size,
       observation_size,
@@ -116,5 +141,7 @@ def make_ts_networks(
   return TSNetworks(
       policy_network=policy_network,
       value_network=value_network,
+      teacher_network=teacher_network,
+      student_network=student_network,
       parametric_action_distribution=parametric_action_distribution,
   )

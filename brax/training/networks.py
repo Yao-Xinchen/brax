@@ -722,3 +722,36 @@ def make_policy_network_latents(
   return FeedForwardNetwork(
       init=lambda key: module.init(key, dummy_obs), apply=apply
   )
+
+
+def make_encoder_network(
+    param_size: int,
+    observation_size: types.ObservationSize,
+    preprocess_observations_fn: types.PreprocessObservationFn = types.identity_observation_preprocessor,
+    hidden_layer_sizes: Sequence[int] = (256, 256),
+    activation: ActivationFn = linen.relu,
+    kernel_init: Initializer = jax.nn.initializers.lecun_uniform(),
+    layer_norm: bool = False,
+    obs_key: str = 'state',
+) -> FeedForwardNetwork:
+  encoder_model = MLP(
+      layer_sizes=list(hidden_layer_sizes) + [param_size],
+      activation=activation,
+      kernel_init=kernel_init,
+      layer_norm=layer_norm,
+  )
+
+  def apply(processor_params, encoder_params, obs):
+    if obs_key:
+      state_obs = preprocess_observations_fn(
+        obs[obs_key], normalizer_select(processor_params, obs_key)
+      )
+      obs = {**obs, obs_key: state_obs}
+    return encoder_model.apply(encoder_params, obs)
+
+  obs_size_val = _get_obs_state_size(observation_size, obs_key)
+  dummy_obs = jnp.zeros((1, obs_size_val))
+
+  return FeedForwardNetwork(
+      init=lambda key: encoder_model.init(key, dummy_obs), apply=apply
+  )
