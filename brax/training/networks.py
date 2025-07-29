@@ -128,10 +128,11 @@ class EMLP(linen.Module):
           bias=self.bias,
           layer_norm=self.layer_norm,
       )(obs_history)
+      encoded_history = linen.normalization.LayerNorm(use_bias=False, use_scale=False)(encoded_history)
       combined_input = jnp.concatenate([obs, encoded_history], axis=-1)
     else:
       combined_input = obs
-    
+
     return MLP(
         layer_sizes=self.layer_sizes,
         activation=self.activation,
@@ -407,7 +408,7 @@ def make_policy_network(
         main_obs = preprocess_observations_fn(
             obs[obs_key], normalizer_select(processor_params, obs_key)
         )
-        
+
         # Process encoder observation if present
         if encoder_obs_key in obs:
           encoder_obs = preprocess_observations_fn(
@@ -417,7 +418,7 @@ def make_policy_network(
           raise NotImplementedError(
             f'Encoder observation key "{encoder_obs_key}" not found in observations.'
           )
-        
+
         return policy_module.apply(policy_params, main_obs, encoder_obs)
       else:
         raise NotImplementedError(
@@ -438,7 +439,7 @@ def make_policy_network(
     # For EMLP, create two dummy observations
     obs_size_val = _get_obs_state_size(obs_size, obs_key)
     dummy_obs = jnp.zeros((1, obs_size_val))
-    
+
     if isinstance(obs_size, Mapping) and encoder_obs_key in obs_size:
       encoder_obs_size = _get_obs_state_size(obs_size, encoder_obs_key)
       dummy_encoder_obs = jnp.zeros((1, encoder_obs_size))
@@ -446,7 +447,7 @@ def make_policy_network(
       raise NotImplementedError(
           f'Encoder observation key "{encoder_obs_key}" not found in obs_size.'
       )
-    
+
     def init(key):
       policy_module_params = policy_module.init(key, dummy_obs, dummy_encoder_obs)
       return policy_module_params
@@ -454,7 +455,7 @@ def make_policy_network(
     # For regular MLP
     obs_size_val = _get_obs_state_size(obs_size, obs_key)
     dummy_obs = jnp.zeros((1, obs_size_val))
-    
+
     def init(key):
       policy_module_params = policy_module.init(key, dummy_obs)
       return policy_module_params
