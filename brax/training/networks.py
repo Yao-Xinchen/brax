@@ -414,24 +414,16 @@ def make_policy_network(
               obs[encoder_obs_key], normalizer_select(processor_params, encoder_obs_key)
           )
         else:
-          # No encoder obs available, create zeros with proper size
-          if isinstance(obs_size, Mapping) and encoder_obs_key in obs_size:
-            encoder_obs_size = _get_obs_state_size(obs_size, encoder_obs_key)
-            encoder_obs = jnp.zeros(main_obs.shape[:-1] + (encoder_obs_size,))
-          else:
-            # Fallback: use same size as main obs
-            encoder_obs = jnp.zeros_like(main_obs)
+          raise NotImplementedError(
+            f'Encoder observation key "{encoder_obs_key}" not found in observations.'
+          )
         
         return policy_module.apply(policy_params, main_obs, encoder_obs)
       else:
-        # Array input (backward compatibility) - split array
-        obs_processed = preprocess_observations_fn(obs, processor_params)
-        # For backward compatibility, assume first part is obs, rest is encoder_obs
-        # This is a fallback - dictionary input is preferred
-        obs_size_val = _get_obs_state_size(obs_size, obs_key)
-        main_obs = obs_processed[..., :obs_size_val]
-        encoder_obs = obs_processed[..., obs_size_val:]
-        return policy_module.apply(policy_params, main_obs, encoder_obs)
+        raise NotImplementedError(
+            'EMLP expects observations to be a dictionary with keys for'
+            f' main observation "{obs_key}" and encoder observation "{encoder_obs_key}".'
+        )
     else:
       # For regular MLP, use original logic
       if isinstance(obs, Mapping):
@@ -451,8 +443,9 @@ def make_policy_network(
       encoder_obs_size = _get_obs_state_size(obs_size, encoder_obs_key)
       dummy_encoder_obs = jnp.zeros((1, encoder_obs_size))
     else:
-      # Fallback: assume same size as main obs
-      dummy_encoder_obs = jnp.zeros((1, obs_size_val))
+      raise NotImplementedError(
+          f'Encoder observation key "{encoder_obs_key}" not found in obs_size.'
+      )
     
     def init(key):
       policy_module_params = policy_module.init(key, dummy_obs, dummy_encoder_obs)
