@@ -178,7 +178,16 @@ def compute_ppo_loss(
 
   # Value function loss
   v_error = vs - baseline
-  v_loss = jnp.mean(v_error * v_error) * 0.5 * 0.5
+  v_loss_unmasked = v_error * v_error * 0.5
+  
+  # Mask the value loss to only include data from the PPO policy
+  is_from_ppo_policy_mask = data.extras['is_from_ppo_policy']
+  v_loss_masked = v_loss_unmasked * is_from_ppo_policy_mask
+  
+  # Compute the mean over the masked samples
+  num_ppo_samples = jnp.sum(is_from_ppo_policy_mask)
+  v_loss = jnp.sum(v_loss_masked) / (num_ppo_samples + 1e-8)
+  v_loss *= 0.5  # Original scaling factor
 
   # Entropy reward
   entropy = jnp.mean(parametric_action_distribution.entropy(policy_logits, rng))

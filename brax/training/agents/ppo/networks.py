@@ -75,26 +75,11 @@ def make_ppo_networks(
     policy_obs_key: str = 'state',
     value_obs_key: str = 'state',
     encoder_obs_key: str = 'state_history',
-    distribution_type: Literal['normal', 'tanh_normal'] = 'tanh_normal',
-    noise_std_type: Literal['scalar', 'log'] = 'scalar',
-    init_noise_std: float = 1.0,
-    state_dependent_std: bool = False,
 ) -> PPONetworks:
   """Make PPO networks with preprocessor."""
-  parametric_action_distribution: distribution.ParametricDistribution
-  if distribution_type == 'normal':
-    parametric_action_distribution = distribution.NormalDistribution(
-        event_size=action_size
-    )
-  elif distribution_type == 'tanh_normal':
-    parametric_action_distribution = distribution.NormalTanhDistribution(
-        event_size=action_size
-    )
-  else:
-    raise ValueError(
-        f'Unsupported distribution type: {distribution_type}. Must be one'
-        ' of "normal" or "tanh_normal".'
-    )
+  parametric_action_distribution = distribution.NormalTanhDistribution(
+      event_size=action_size
+  )
   policy_network = networks.make_policy_network(
       parametric_action_distribution.param_size,
       observation_size,

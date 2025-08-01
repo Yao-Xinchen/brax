@@ -34,8 +34,8 @@ from brax.training.acme import specs
 from brax.training.agents.ppo import checkpoint
 from brax.training.agents.ppo import losses as ppo_losses
 from brax.training.agents.ppo import networks as ppo_networks
-from brax.training.types import Params
-from brax.training.types import PRNGKey
+from brax.training.types import Params  # pylint: disable=g-importing-member
+from brax.training.types import PRNGKey  # pylint: disable=g-importing-member
 import flax
 import jax
 import jax.numpy as jnp
@@ -57,6 +57,7 @@ class TrainingState:
   params: ppo_losses.PPONetworkParams
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: types.UInt64
+  apg_optimizer_state: Optional[optax.OptState] = None
 
 
 def _unpmap(v):
@@ -68,7 +69,7 @@ def _strip_weak_type(tree):
   # avoid extra jit recompilations we strip all weak types from user input
   def f(leaf):
     leaf = jnp.asarray(leaf)
-    return jnp.astype(leaf, leaf.dtype)
+    return leaf.astype(leaf.dtype)
 
   return jax.tree_util.tree_map(f, tree)
 
@@ -117,7 +118,7 @@ def _maybe_wrap_env(
     # all devices gets the same randomization rng
     randomization_rng = jax.random.split(key_env, randomization_batch_size)
     v_randomization_fn = functools.partial(
-        randomization_fn, rng=randomization_rng
+        randomization_fn, rng=randomization_rng  # pylint: disable=unexpected-keyword-arg
     )
   if wrap_env_fn is not None:
     wrap_for_training = wrap_env_fn
@@ -242,6 +243,15 @@ def train(
     restore_params: Optional[Any] = None,
     restore_value_fn: bool = True,
     run_evals: bool = True,
+    # HYBRID PPO/APG: New APG parameters
+    apg_update_frequency: int = 5,
+    apg_horizon_length: int = 16,
+    apg_learning_rate: float = 1e-4,
+    apg_discount_factor: float = 0.99,
+    apg_num_env: int = 512,
+    apg_num_updates_per_batch: int = 10,
+    apg_stop_env_step: Optional[int] = None, #TODO: check this part.
+    apg_use_value_function: bool = True,
 ):
   """PPO training.
 
@@ -289,6 +299,13 @@ def train(
     network_factory: function that generates networks for policy and value
       functions
     seed: random seed
+    apg_update_frequency: How often to run APG update. 0 to disable. PPO/APG
+      apg_update_frequency=10 means run APG update every 10 PPO updates.
+    apg_horizon_length: Horizon for APG rollouts.
+    apg_learning_rate: Optional separate learning rate for APG.
+    apg_discount_factor: Discount factor for APG returns.
+    apg_num_env: Number of parallel environments for APG rollouts.
+    apg_num_updates_per_batch: Number of times to reuse APG data for updates.
     num_evals: the number of evals to run during the entire training run.
       Increasing the number of evals increases total training time
     eval_env: an optional environment for eval only, defaults to `environment`
@@ -341,10 +358,25 @@ def train(
   )
   device_count = local_devices_to_use * process_count
 
-  # The number of environment steps executed for every training step.
-  env_step_per_training_step = (
+  # The number of environment steps executed for every PPO training step.
+  ppo_env_step_per_training_step = (
       batch_size * unroll_length * num_minibatches * action_repeat
   )
+  # The number of environment steps executed for every APG training step.
+  apg_env_step_per_training_step = (
+      apg_horizon_length * apg_num_env * apg_num_updates_per_batch * action_repeat
+  )
+  # Average step count per training step, used to approximate the total number
+  # of training steps.
+  avg_apg_step_per_training_step = (
+      apg_env_step_per_training_step / apg_update_frequency
+      if apg_update_frequency > 0
+      else 0
+  )
+  env_step_per_training_step = (
+      ppo_env_step_per_training_step + avg_apg_step_per_training_step
+  )
+
   num_evals_after_init = max(num_evals - 1, 1)
   # The number of training_step calls per training_epoch call.
   # equals to ceil(num_timesteps / (num_evals * env_step_per_training_step *
@@ -401,10 +433,10 @@ def train(
   )
   make_policy = ppo_networks.make_inference_fn(ppo_network)
 
-  optimizer = optax.adam(learning_rate=learning_rate)
+  # HYBRID PPO/APG: Use apg_learning_rate if provided, otherwise PPO's LR
+  ppo_optimizer = optax.adam(learning_rate=learning_rate)
   if max_grad_norm is not None:
-    # TODO: Move gradient clipping to `training/gradients.py`.
-    optimizer = optax.chain(
+    ppo_optimizer = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
         optax.adam(learning_rate=learning_rate),
     )
@@ -421,7 +453,7 @@ def train(
   )
 
   gradient_update_fn = gradients.gradient_update_fn(
-      loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+      loss_fn, ppo_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
 
   metrics_aggregator = metric_logger.EpisodeMetricsLogger(
@@ -430,22 +462,138 @@ def train(
       progress_fn=progress_fn,
   )
 
+  ## HYBRID PPO/APG: Define APG update logic if enabled
+  apg_grad_fn = None
+  apg_optimizer = None
+  if apg_update_frequency > 0:
+    apg_lr = apg_learning_rate if apg_learning_rate is not None else learning_rate
+
+    # APG Learning Rate Decay
+    # total_training_steps = num_timesteps // env_step_per_training_step 
+    # total_apg_optimizer_steps = (
+    #     total_training_steps // apg_update_frequency
+    # ) * apg_num_updates_per_batch
+
+    # learning_rate_schedule = optax.exponential_decay(
+    #     init_value=apg_lr,
+    #     transition_steps=max(1, total_apg_optimizer_steps),
+    #     decay_rate=0.9,
+    #     end_value=0.0,
+    # )
+
+    # apg_optimizer = optax.adam(learning_rate=learning_rate_schedule)
+    apg_optimizer = optax.adam(learning_rate=apg_lr)
+    if max_grad_norm is not None:
+      apg_optimizer = optax.chain(
+          optax.clip_by_global_norm(max_grad_norm),
+          optax.adam(learning_rate=apg_lr),
+      )
+    # This policy is just for APG's internal rollouts
+    def make_apg_policy(
+        params: types.PolicyParams, deterministic: bool = True
+    ) -> types.Policy:
+      # Note: This is a simplified policy maker for APG. It doesn't include the value function.
+      def policy(
+          observations: types.Observation, key_sample: PRNGKey
+      ) -> Tuple[types.Action, types.Extra]:
+        logits = ppo_network.policy_network.apply(*params, observations)
+        if deterministic:
+          return ppo_network.parametric_action_distribution.mode(logits), {}
+        return (
+            ppo_network.parametric_action_distribution.sample(
+                logits, key_sample
+            ),
+            {},
+        )
+
+      return policy
+
+    def make_apg_value_fn(
+        normalizer_params: running_statistics.RunningStatisticsState, value_params
+    ) -> Callable:
+      def value_fn(observations: types.Observation) -> jnp.ndarray:
+        return ppo_network.value_network.apply(
+            normalizer_params, value_params, observations
+        )
+
+      return value_fn
+
+    def env_step_for_apg(
+        carry: Tuple[envs.State, PRNGKey], _, policy: types.Policy
+    ):
+      env_state, key = carry
+      key, key_sample = jax.random.split(key)
+      actions, _ = policy(env_state.obs, key_sample)
+      nstate = env.step(env_state, actions)
+      return (nstate, key), nstate.reward
+
+    def select_first_n_envs(env_state: envs.State, n: int) -> envs.State:
+      """Select the first n environments' state"""
+      return jax.tree_util.tree_map(
+          lambda x: x[:n] if isinstance(x, jnp.ndarray) else x, env_state
+      )
+
+    def apg_loss_fn(
+        policy_params,
+        value_params,
+        normalizer_params,
+        current_env_state,
+        key,
+    ):
+      """Calculates APG loss, including the differentiable rollout."""
+      # --- Rollout generation is now INSIDE the loss function ---
+      apg_policy = make_apg_policy((normalizer_params, policy_params))
+      # add the sanity check for the apg_num_env
+      assert apg_num_env <= current_env_state.obs.shape[0], "apg_num_env is greater than the number of environments"
+      current_env_state_apg = select_first_n_envs(
+          current_env_state, apg_num_env
+      )
+      f = functools.partial(env_step_for_apg, policy=apg_policy)
+      (nstate, _), rewards = jax.lax.scan(
+          f, (current_env_state_apg, key), None, length=apg_horizon_length
+      )
+      # --- End of rollout generation ---
+
+      terminal_obs = nstate.obs
+      discount_factor = apg_discount_factor
+      discount_factor_array = (
+          discount_factor ** jnp.arange(apg_horizon_length)
+      )[:, None]
+      sum_discounted_rewards = jnp.sum(rewards * discount_factor_array, axis=0)
+      loss = -jnp.mean(sum_discounted_rewards)
+
+      # TODO: check this part.
+      if apg_use_value_function:
+        value_fn = make_apg_value_fn(normalizer_params, value_params)
+        terminal_state_values = value_fn(terminal_obs)
+        loss -= jnp.mean(terminal_state_values) * discount_factor**apg_horizon_length
+
+      return loss
+
+    apg_grad_fn = jax.grad(
+        apg_loss_fn, argnums=0
+    )  # Grad only w.r.t policy_params
+
+
   def minibatch_step(
       carry,
       data: types.Transition,
       normalizer_params: running_statistics.RunningStatisticsState,
   ):
     optimizer_state, params, key = carry
+    # old_policy_params = params.policy
     key, key_loss = jax.random.split(key)
-    (_, metrics), params, optimizer_state = gradient_update_fn(
+    (_, metrics), params, optimizer_state, grads = gradient_update_fn(
         params,
         normalizer_params,
         data,
         key_loss,
         optimizer_state=optimizer_state,
     )
+    ppo_policy_grads = grads.policy
+    ppo_value_grads = grads.value
 
-    return (optimizer_state, params, key), metrics
+    return (optimizer_state, params, key), (metrics, ppo_policy_grads)
 
   def sgd_step(
       carry,
@@ -474,106 +622,239 @@ def train(
       return x
 
     shuffled_data = jax.tree_util.tree_map(convert_data, data)
-    (optimizer_state, params, _), metrics = jax.lax.scan(
+    (optimizer_state, params, _), (metrics, ppo_policy_grads) = jax.lax.scan(
         functools.partial(minibatch_step, normalizer_params=normalizer_params),
         (optimizer_state, params, key_grad),
         shuffled_data,
         length=num_minibatches,
     )
-    return (optimizer_state, params, key), metrics
+    # ppo_policy_grads = _unpmap(ppo_policy_grads)
+    ppo_policy_grads = jax.tree_util.tree_map(
+        lambda x: jnp.mean(x, axis=0), ppo_policy_grads
+    )
+    return (optimizer_state, params, key), (metrics, ppo_policy_grads)
 
   def training_step(
-      carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
-  ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
-    training_state, state, key = carry
-    key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
+      carry: Tuple[TrainingState, envs.State, PRNGKey, int], unused_t
+  ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey, int], Metrics]:
+    training_state, state, key, step_count = carry
+    key_apg, key_generate_unroll, key_sgd, new_key = jax.random.split(key, 4)
 
-    policy = make_policy((
-        training_state.normalizer_params,
-        training_state.params.policy,
-        training_state.params.value,
-    ))
+    # Step 1: APG Update (policy_t -> temp_new_policy)
+    # ---------------------------------------------------------
+    if apg_update_frequency > 0:
 
-    def f(carry, unused_t):
-      current_state, current_key = carry
-      current_key, next_key = jax.random.split(current_key)
-      next_state, data = acting.generate_unroll(
+      def get_exploratory_policy_params(
+          ts_ppo: TrainingState, key: PRNGKey
+      ) -> ppo_losses.PPONetworkParams:
+        """Performs APG update to get a temporary exploratory policy."""
+
+        def apg_update_step(inner_carry, key_step):
+          apg_optimizer_state, params_to_update = inner_carry
+          grads = apg_grad_fn(
+              params_to_update.policy,
+              params_to_update.value,
+              ts_ppo.normalizer_params,
+              state,
+              key_step,
+          )
+          grads = jax.lax.pmean(grads, axis_name=_PMAP_AXIS_NAME)
+          grads = jax.tree_util.tree_map(
+              lambda x: jnp.where(jnp.isnan(x), jnp.zeros_like(x), x), grads
+          )
+          full_grads_tree = ts_ppo.params.replace(
+              policy=grads,
+              value=jax.tree_util.tree_map(jnp.zeros_like, ts_ppo.params.value),
+          )
+          params_update, apg_optimizer_state = apg_optimizer.update(
+              full_grads_tree, apg_optimizer_state, params=ts_ppo.params
+          )
+          updated_params = optax.apply_updates(ts_ppo.params, params_update)
+          return (apg_optimizer_state, updated_params), None
+
+        initial_apg_opt_state = apg_optimizer.init(ts_ppo.params)
+        keys = jax.random.split(key, apg_num_updates_per_batch)
+        (_, temp_params), _ = jax.lax.scan(
+            apg_update_step, (initial_apg_opt_state, ts_ppo.params), keys
+        )
+        return temp_params
+
+      def do_apg_update(
+          carry: Tuple[TrainingState, PRNGKey]
+      ) -> Tuple[ppo_losses.PPONetworkParams, jnp.ndarray]:
+        """Runs APG update and returns new params and imaginary step count."""
+        ts, k = carry
+        temp_params = get_exploratory_policy_params(ts, k)
+        return temp_params, jnp.array(
+            apg_env_step_per_training_step, dtype=jnp.uint32
+        )
+
+      def no_apg_update(
+          carry: Tuple[TrainingState, PRNGKey]
+      ) -> Tuple[ppo_losses.PPONetworkParams, jnp.ndarray]:
+        """Returns original params and 0 imaginary steps."""
+        ts, _ = carry
+        return ts.params, jnp.array(0, dtype=jnp.uint32)
+
+      temp_params, imaginary_steps = jax.lax.cond(
+          step_count % apg_update_frequency == 0,
+          do_apg_update,
+          no_apg_update,
+          (training_state, key_apg),
+      )
+    else:
+      temp_params = training_state.params
+      imaginary_steps = jnp.array(0, dtype=jnp.uint32)
+
+    # Step 2: Collect Data with both policies and Merge
+    # ---------------------------------------------------------
+    ppo_policy_explore = make_policy(
+        (
+            training_state.normalizer_params,
+            training_state.params.policy,
+            training_state.params.value,
+        )
+    )
+    temp_policy_explore = make_policy(
+        (training_state.normalizer_params, temp_params.policy, temp_params.value)
+    )
+
+    assert num_envs % 2 == 0, (
+        'num_envs must be even for parallel rollout with two policies.'
+    )
+    num_envs_per_policy = num_envs // 2
+    # num_envs_per_policy = num_envs
+    state_ppo = jax.tree_util.tree_map(lambda x: x[:num_envs_per_policy], state)
+    state_apg = jax.tree_util.tree_map(lambda x: x[num_envs_per_policy:], state)
+  
+    def f_multi_policy(carry, unused_t):
+      (current_state_ppo, current_state_apg, current_key) = carry
+      key_ppo, key_apg_rollout, next_key = jax.random.split(current_key, 3)
+
+      next_state_ppo, data_ppo = acting.generate_unroll(
           env,
-          current_state,
-          policy,
-          current_key,
+          current_state_ppo,
+          ppo_policy_explore,
+          key_ppo,
           unroll_length,
           extra_fields=('truncation', 'episode_metrics', 'episode_done'),
       )
-      return (next_state, next_key), data
+      next_state_apg, data_apg = acting.generate_unroll(
+          env,
+          current_state_apg,
+          temp_policy_explore,
+          key_apg_rollout,
+          unroll_length,
+          extra_fields=('truncation', 'episode_metrics', 'episode_done'),
+      )
 
-    (state, _), data = jax.lax.scan(
-        f,
-        (state, key_generate_unroll),
+      # Create source labels for each dataset.
+      ppo_labels = jnp.ones_like(data_ppo.reward, dtype=jnp.float32)
+      apg_labels = jnp.zeros_like(data_apg.reward, dtype=jnp.float32)
+      merged_labels = jnp.concatenate([ppo_labels, apg_labels], axis=1)
+
+      data_merged = jax.tree_util.tree_map(
+          lambda x, y: jnp.concatenate([x, y], axis=1), data_ppo, data_apg
+      )
+
+      # Add the merged labels to the extras dictionary.
+      data_merged.extras['is_from_ppo_policy'] = merged_labels
+
+      return (next_state_ppo, next_state_apg, next_key), data_merged
+
+    final_carry, merged_data_from_scan = jax.lax.scan(
+        f_multi_policy,
+        (state_ppo, state_apg, key_generate_unroll),
         (),
         length=batch_size * num_minibatches // num_envs,
     )
-    # Have leading dimensions (batch_size * num_minibatches, unroll_length)
-    data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
-    data = jax.tree_util.tree_map(
-        lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data
+    (final_state_ppo, final_state_apg, _) = final_carry
+    state = jax.tree_util.tree_map(
+        lambda x, y: jnp.concatenate([x, y], axis=0),
+        final_state_ppo,
+        final_state_apg,
     )
-    assert data.discount.shape[1:] == (unroll_length,)
 
-    if log_training_metrics:  # log unroll metrics
+    if log_training_metrics:
       jax.debug.callback(
           metrics_aggregator.update_episode_metrics,
-          data.extras['state_extras']['episode_metrics'],
-          data.extras['state_extras']['episode_done'],
+          merged_data_from_scan.extras['state_extras']['episode_metrics'],
+          merged_data_from_scan.extras['state_extras']['episode_done'],
       )
 
-    # Update normalization params and normalize observations.
-    normalizer_params = running_statistics.update(
+    merged_data = jax.tree_util.tree_map(
+        lambda x: jnp.swapaxes(x, 1, 2), merged_data_from_scan
+    )
+    merged_data = jax.tree_util.tree_map(
+        lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), merged_data
+    )
+
+    # Step 3: Final PPO Update with merged data
+    # ---------------------------------------------------------
+    normalizer_params_final = running_statistics.update(
         training_state.normalizer_params,
-        _remove_pixels(data.observation),
+        _remove_pixels(merged_data.observation),
         pmap_axis_name=_PMAP_AXIS_NAME,
     )
 
-    (optimizer_state, params, _), metrics = jax.lax.scan(
+    (final_optimizer_state, final_params, _,), (
+        final_metrics,
+        _,
+    ) = jax.lax.scan(
         functools.partial(
-            sgd_step, data=data, normalizer_params=normalizer_params
+            sgd_step, data=merged_data, normalizer_params=normalizer_params_final
         ),
         (training_state.optimizer_state, training_state.params, key_sgd),
         (),
         length=num_updates_per_batch,
     )
-
-    new_training_state = TrainingState(
-        optimizer_state=optimizer_state,
-        params=params,
-        normalizer_params=normalizer_params,
-        env_steps=training_state.env_steps + env_step_per_training_step,
+    final_metrics = jax.tree_util.tree_map(
+        lambda x: jnp.mean(x, axis=0), final_metrics
     )
-    return (new_training_state, state, new_key), metrics
+
+    total_steps_this_turn = ppo_env_step_per_training_step + imaginary_steps
+    final_training_state = TrainingState(
+        optimizer_state=final_optimizer_state,
+        params=final_params,
+        normalizer_params=normalizer_params_final,
+        env_steps=training_state.env_steps + total_steps_this_turn,
+        apg_optimizer_state=training_state.apg_optimizer_state,
+    )
+
+    # Placeholder metrics for now
+    final_metrics['apg_grad_norm'] = jnp.array(0.0)
+    final_metrics['apg_loss'] = jnp.array(0.0)
+    final_metrics['apg_cosine_similarity'] = jnp.array(0.0)
+
+    return (final_training_state, state, new_key, step_count + 1), final_metrics
 
   def training_epoch(
-      training_state: TrainingState, state: envs.State, key: PRNGKey
-  ) -> Tuple[TrainingState, envs.State, Metrics]:
-    (training_state, state, _), loss_metrics = jax.lax.scan(
+      carry: Tuple[TrainingState, envs.State, PRNGKey, int], ## HYBRID PPO/APG: Add step_count to carry
+  ) -> Tuple[TrainingState, envs.State, Metrics, int]: ## HYBRID PPO/APG: Return step_count
+    training_state, state, key, step_count = carry ## HYBRID PPO/APG: Unpack step_count
+    (training_state, state, _, step_count), loss_metrics = jax.lax.scan(
         training_step,
-        (training_state, state, key),
+        (training_state, state, key, step_count),
         (),
         length=num_training_steps_per_epoch,
     )
     loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)
-    return training_state, state, loss_metrics
+    return training_state, state, loss_metrics, step_count ## HYBRID PPO/APG: Return updated step_count
 
-  training_epoch = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME)
+  training_epoch_pmap = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME) ## HYBRID PPO/APG: Renamed to avoid collision
 
   # Note that this is NOT a pure jittable method.
   def training_epoch_with_timing(
-      training_state: TrainingState, env_state: envs.State, key: PRNGKey
-  ) -> Tuple[TrainingState, envs.State, Metrics]:
+      training_state: TrainingState, 
+      env_state: envs.State, 
+      key: PRNGKey, 
+      step_count: jnp.ndarray ## HYBRID PPO/APG: Pass in step_count
+  ) -> Tuple[TrainingState, envs.State, Metrics, jnp.ndarray]: ## HYBRID PPO/APG: Return step_count
     nonlocal training_walltime
     t = time.time()
     training_state, env_state = _strip_weak_type((training_state, env_state))
-    result = training_epoch(training_state, env_state, key)
-    training_state, env_state, metrics = _strip_weak_type(result)
+    result = training_epoch_pmap( (training_state, env_state, key, step_count) ) ## HYBRID PPO/APG: Pass tuple to pmapped func
+    training_state, env_state, metrics, step_count = _strip_weak_type(result) ## HYBRID PPO/APG: Unpack step_count
 
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
     jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
@@ -590,7 +871,7 @@ def train(
         'training/walltime': training_walltime,
         **{f'training/{name}': value for name, value in metrics.items()},
     }
-    return training_state, env_state, metrics  # pytype: disable=bad-return-type  # py311-upgrade
+    return training_state, env_state, metrics, step_count  # pytype: disable=bad-return-type  # py311-upgrade
 
   # Initialize model params and training state.
   init_params = ppo_losses.PPONetworkParams(
@@ -602,13 +883,18 @@ def train(
       lambda x: specs.Array(x.shape[-1:], jnp.dtype('float32')), env_state.obs
   )
   training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
-      optimizer_state=optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
+      optimizer_state=ppo_optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
       params=init_params,
       normalizer_params=running_statistics.init_state(
           _remove_pixels(obs_shape)
       ),
       env_steps=types.UInt64(hi=0, lo=0),
   )
+
+  if apg_optimizer:
+    training_state = training_state.replace(
+        apg_optimizer_state=apg_optimizer.init(init_params)
+    )
 
   if restore_checkpoint_path is not None:
     params = checkpoint.load(restore_checkpoint_path)
@@ -668,6 +954,7 @@ def train(
   training_metrics = {}
   training_walltime = 0
   current_step = 0
+  training_step_count = 0 ## HYBRID PPO/APG: Initialize step counter
 
   # Run initial eval
   metrics = {}
@@ -698,15 +985,23 @@ def train(
       # optimization
       epoch_key, local_key = jax.random.split(local_key)
       epoch_keys = jax.random.split(epoch_key, local_devices_to_use)
-      (training_state, env_state, training_metrics) = (
-          training_epoch_with_timing(training_state, env_state, epoch_keys)
+      # HYBRID PPO/APG: Pass and receive the training_step_count
+      step_count_array = jnp.array(training_step_count)
+      replicated_step_count = jax.device_put_replicated(
+          step_count_array, jax.local_devices()[:local_devices_to_use]
       )
+
+      (training_state, env_state, training_metrics, returned_replicated_count) = (
+          training_epoch_with_timing(training_state, env_state, epoch_keys, replicated_step_count)
+      )
+      training_step_count = int(_unpmap(returned_replicated_count))
+
       current_step = int(_unpmap(training_state.env_steps))
 
       key_envs = jax.vmap(
           lambda x, s: jax.random.split(x[0], s), in_axes=(0, None)
       )(key_envs, key_envs.shape[1])
-      # TODO: move extra reset logic to the AutoResetWrapper.
+      # TODO(brax-team): move extra reset logic to the AutoResetWrapper.
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
 
     if process_id != 0:
