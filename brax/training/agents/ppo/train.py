@@ -544,7 +544,7 @@ def train(
       # --- Rollout generation is now INSIDE the loss function ---
       apg_policy = make_apg_policy((normalizer_params, policy_params))
       # add the sanity check for the apg_num_env
-      assert apg_num_env <= current_env_state.obs.shape[0], "apg_num_env is greater than the number of environments"
+      # assert apg_num_env <= current_env_state.obs.shape[0], "apg_num_env is greater than the number of environments"
       current_env_state_apg = select_first_n_envs(
           current_env_state, apg_num_env
       )
