@@ -167,6 +167,19 @@ def compute_ppo_loss(
   )
   if normalize_advantage:
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+  # Separate advantages for logging
+  is_from_ppo_policy_mask = data.extras['is_from_ppo_policy']
+  num_ppo_samples = jnp.sum(is_from_ppo_policy_mask)
+  num_apg_explore_samples = jnp.sum(1 - is_from_ppo_policy_mask)
+
+  mean_advantage_ppo = jnp.sum(advantages * is_from_ppo_policy_mask) / (
+      num_ppo_samples + 1e-8
+  )
+  mean_advantage_apg = jnp.sum(advantages * (1 - is_from_ppo_policy_mask)) / (
+      num_apg_explore_samples + 1e-8
+  )
+
   rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
 
   surrogate_loss1 = rho_s * advantages
@@ -179,11 +192,11 @@ def compute_ppo_loss(
   # Value function loss
   v_error = vs - baseline
   v_loss_unmasked = v_error * v_error * 0.5
-  
+
   # Mask the value loss to only include data from the PPO policy
   is_from_ppo_policy_mask = data.extras['is_from_ppo_policy']
   v_loss_masked = v_loss_unmasked * is_from_ppo_policy_mask
-  
+
   # Compute the mean over the masked samples
   num_ppo_samples = jnp.sum(is_from_ppo_policy_mask)
   v_loss = jnp.sum(v_loss_masked) / (num_ppo_samples + 1e-8)
@@ -199,4 +212,6 @@ def compute_ppo_loss(
       'policy_loss': policy_loss,
       'v_loss': v_loss,
       'entropy_loss': entropy_loss,
+      'advantage/ppo_data': mean_advantage_ppo,
+      'advantage/apg_data': mean_advantage_apg,
   }

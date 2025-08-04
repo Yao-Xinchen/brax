@@ -58,6 +58,7 @@ class TrainingState:
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: types.UInt64
   apg_optimizer_state: Optional[optax.OptState] = None
+  temp_params: Optional[ppo_losses.PPONetworkParams] = None
 
 
 def _unpmap(v):
@@ -251,6 +252,7 @@ def train(
     apg_num_env: int = 512,
     apg_num_updates_per_batch: int = 10,
     apg_stop_env_step: Optional[int] = None, #TODO: check this part.
+    apg_rollout_ratio: float = 0.5,
     apg_use_value_function: bool = True,
 ):
   """PPO training.
@@ -469,7 +471,7 @@ def train(
     apg_lr = apg_learning_rate if apg_learning_rate is not None else learning_rate
 
     # APG Learning Rate Decay
-    # total_training_steps = num_timesteps // env_step_per_training_step 
+    # total_training_steps = num_timesteps // env_step_per_training_step
     # total_apg_optimizer_steps = (
     #     total_training_steps // apg_update_frequency
     # ) * apg_num_updates_per_batch
@@ -667,9 +669,9 @@ def train(
               value=jax.tree_util.tree_map(jnp.zeros_like, ts_ppo.params.value),
           )
           params_update, apg_optimizer_state = apg_optimizer.update(
-              full_grads_tree, apg_optimizer_state, params=ts_ppo.params
+              full_grads_tree, apg_optimizer_state, params=params_to_update
           )
-          updated_params = optax.apply_updates(ts_ppo.params, params_update)
+          updated_params = optax.apply_updates(params_to_update, params_update)
           return (apg_optimizer_state, updated_params), None
 
         initial_apg_opt_state = apg_optimizer.init(ts_ppo.params)
@@ -719,45 +721,65 @@ def train(
         (training_state.normalizer_params, temp_params.policy, temp_params.value)
     )
 
-    assert num_envs % 2 == 0, (
-        'num_envs must be even for parallel rollout with two policies.'
-    )
-    num_envs_per_policy = num_envs // 2
-    # num_envs_per_policy = num_envs
-    state_ppo = jax.tree_util.tree_map(lambda x: x[:num_envs_per_policy], state)
-    state_apg = jax.tree_util.tree_map(lambda x: x[num_envs_per_policy:], state)
-  
+    # Calculate the number of environments for APG based on the ratio
+    if apg_update_frequency > 0:
+        num_envs_apg = int(num_envs * apg_rollout_ratio)
+    else:
+        num_envs_apg = 0
+    num_envs_ppo = num_envs - num_envs_apg
+
+    state_ppo = jax.tree_util.tree_map(lambda x: x[:num_envs_ppo], state)
+    state_apg = jax.tree_util.tree_map(lambda x: x[num_envs_ppo:], state)
+
     def f_multi_policy(carry, unused_t):
       (current_state_ppo, current_state_apg, current_key) = carry
       key_ppo, key_apg_rollout, next_key = jax.random.split(current_key, 3)
 
-      next_state_ppo, data_ppo = acting.generate_unroll(
-          env,
-          current_state_ppo,
-          ppo_policy_explore,
-          key_ppo,
-          unroll_length,
-          extra_fields=('truncation', 'episode_metrics', 'episode_done'),
-      )
-      next_state_apg, data_apg = acting.generate_unroll(
-          env,
-          current_state_apg,
-          temp_policy_explore,
-          key_apg_rollout,
-          unroll_length,
-          extra_fields=('truncation', 'episode_metrics', 'episode_done'),
-      )
+      data_ppo, data_apg = None, None
+      next_state_ppo, next_state_apg = current_state_ppo, current_state_apg
 
-      # Create source labels for each dataset.
-      ppo_labels = jnp.ones_like(data_ppo.reward, dtype=jnp.float32)
-      apg_labels = jnp.zeros_like(data_apg.reward, dtype=jnp.float32)
-      merged_labels = jnp.concatenate([ppo_labels, apg_labels], axis=1)
+      if num_envs_ppo > 0:
+        next_state_ppo, data_ppo = acting.generate_unroll(
+            env,
+            current_state_ppo,
+            ppo_policy_explore,
+            key_ppo,
+            unroll_length,
+            extra_fields=('truncation', 'episode_metrics', 'episode_done'),
+        )
 
-      data_merged = jax.tree_util.tree_map(
-          lambda x, y: jnp.concatenate([x, y], axis=1), data_ppo, data_apg
-      )
+      if num_envs_apg > 0:
+        next_state_apg, data_apg = acting.generate_unroll(
+            env,
+            current_state_apg,
+            temp_policy_explore,
+            key_apg_rollout,
+            unroll_length,
+            extra_fields=('truncation', 'episode_metrics', 'episode_done'),
+        )
 
-      # Add the merged labels to the extras dictionary.
+      # Create source labels and merge data conditionally
+      if data_ppo is not None and data_apg is not None:
+        data_merged = jax.tree_util.tree_map(
+            lambda x, y: jnp.concatenate([x, y], axis=1), data_ppo, data_apg
+        )
+        ppo_labels = jnp.ones_like(data_ppo.reward, dtype=jnp.float32)
+        apg_labels = jnp.zeros_like(data_apg.reward, dtype=jnp.float32)
+        merged_labels = jnp.concatenate([ppo_labels, apg_labels], axis=1)
+      elif data_ppo is not None:
+        data_merged = data_ppo
+        merged_labels = jnp.ones_like(data_ppo.reward, dtype=jnp.float32)
+      elif data_apg is not None:
+        data_merged = data_apg
+        merged_labels = jnp.zeros_like(data_apg.reward, dtype=jnp.float32)
+      else:
+        # This case should not be reachable if num_envs > 0
+        # To make JAX tracer happy, create an empty structure
+        data_merged = jax.tree_util.tree_map(
+            lambda x: jnp.empty((unroll_length, 0) + x.shape[2:]), data_ppo
+        )
+        merged_labels = jnp.empty_like(data_merged.reward)
+
       data_merged.extras['is_from_ppo_policy'] = merged_labels
 
       return (next_state_ppo, next_state_apg, next_key), data_merged
@@ -797,6 +819,29 @@ def train(
         pmap_axis_name=_PMAP_AXIS_NAME,
     )
 
+    # HYBRID PPO/APG: Calculate policy divergence metric
+    primary_logits = ppo_network.policy_network.apply(
+        normalizer_params_final, training_state.params.policy, merged_data.observation
+    )
+    explore_logits = ppo_network.policy_network.apply(
+        normalizer_params_final, temp_params.policy, merged_data.observation
+    )
+
+    loc1, log_scale1 = jnp.split(primary_logits, 2, axis=-1)
+    loc2, log_scale2 = jnp.split(explore_logits, 2, axis=-1)
+
+    min_std = ppo_network.parametric_action_distribution._min_std
+    scale1 = jax.nn.softplus(log_scale1) + min_std
+    scale2 = jax.nn.softplus(log_scale2) + min_std
+
+    kl_div_per_dim = (
+        jnp.log(scale2 / scale1)
+        + (jnp.square(scale1) + jnp.square(loc1 - loc2))
+        / (2 * jnp.square(scale2))
+        - 0.5
+    )
+    policy_divergence_kl = jnp.mean(jnp.sum(kl_div_per_dim, axis=-1))
+
     (final_optimizer_state, final_params, _,), (
         final_metrics,
         _,
@@ -811,6 +856,7 @@ def train(
     final_metrics = jax.tree_util.tree_map(
         lambda x: jnp.mean(x, axis=0), final_metrics
     )
+    final_metrics['policy_divergence/kl'] = policy_divergence_kl
 
     total_steps_this_turn = ppo_env_step_per_training_step + imaginary_steps
     final_training_state = TrainingState(
@@ -819,6 +865,7 @@ def train(
         normalizer_params=normalizer_params_final,
         env_steps=training_state.env_steps + total_steps_this_turn,
         apg_optimizer_state=training_state.apg_optimizer_state,
+        temp_params=temp_params,
     )
 
     # Placeholder metrics for now
@@ -845,9 +892,9 @@ def train(
 
   # Note that this is NOT a pure jittable method.
   def training_epoch_with_timing(
-      training_state: TrainingState, 
-      env_state: envs.State, 
-      key: PRNGKey, 
+      training_state: TrainingState,
+      env_state: envs.State,
+      key: PRNGKey,
       step_count: jnp.ndarray ## HYBRID PPO/APG: Pass in step_count
   ) -> Tuple[TrainingState, envs.State, Metrics, jnp.ndarray]: ## HYBRID PPO/APG: Return step_count
     nonlocal training_walltime
@@ -889,6 +936,7 @@ def train(
           _remove_pixels(obs_shape)
       ),
       env_steps=types.UInt64(hi=0, lo=0),
+      temp_params=init_params,  # Initialize temp_params with the same as primary params
   )
 
   if apg_optimizer:
@@ -899,21 +947,25 @@ def train(
   if restore_checkpoint_path is not None:
     params = checkpoint.load(restore_checkpoint_path)
     value_params = params[2] if restore_value_fn else init_params.value
+    restored_params = training_state.params.replace(
+        policy=params[1], value=value_params
+    )
     training_state = training_state.replace(
         normalizer_params=params[0],
-        params=training_state.params.replace(
-            policy=params[1], value=value_params
-        ),
+        params=restored_params,
+        temp_params=restored_params,  # Initialize temp_params to match restored params
     )
 
   if restore_params is not None:
     logging.info('Restoring TrainingState from `restore_params`.')
     value_params = restore_params[2] if restore_value_fn else init_params.value
+    restored_params = training_state.params.replace(
+        policy=restore_params[1], value=value_params
+    )
     training_state = training_state.replace(
         normalizer_params=restore_params[0],
-        params=training_state.params.replace(
-            policy=restore_params[1], value=value_params
-        ),
+        params=restored_params,
+        temp_params=restored_params,  # Initialize temp_params to match restored params
     )
 
   if num_timesteps == 0:
@@ -1034,6 +1086,20 @@ def train(
             params,
             training_metrics,
         )
+        # Add exploratory policy evaluation using temp_params from TrainingState
+        # Only run if APG is enabled (apg_update_frequency > 0)
+        if apg_update_frequency > 0:
+          temp_params = _unpmap((
+              training_state.normalizer_params,
+              training_state.temp_params.policy,
+              training_state.temp_params.value,
+          ))
+          exploratory_metrics = evaluator.run_evaluation_exploratory(
+              temp_params,
+              metrics,
+          )
+          # Merge the exploratory metrics into the main metrics
+          metrics.update(exploratory_metrics)
       logging.info(metrics)
       progress_fn(current_step, metrics)
 

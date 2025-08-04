@@ -87,10 +87,6 @@ def make_ppo_networks(
       hidden_layer_sizes=policy_hidden_layer_sizes,
       activation=activation,
       obs_key=policy_obs_key,
-      distribution_type=distribution_type,
-      noise_std_type=noise_std_type,
-      init_noise_std=init_noise_std,
-      state_dependent_std=state_dependent_std,
       encoder_hidden_layer_sizes=encoder_hidden_layer_sizes,
       encoder_obs_key=encoder_obs_key,
   )

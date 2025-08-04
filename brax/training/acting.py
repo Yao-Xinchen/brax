@@ -155,3 +155,39 @@ class Evaluator:
     }
 
     return metrics  # pytype: disable=bad-return-type  # jax-ndarray
+
+  def run_evaluation_exploratory(
+      self,
+      policy_params: PolicyParams,
+      training_metrics: Metrics,
+      aggregate_episodes: bool = True,
+  ) -> Metrics:
+    """Run one epoch of evaluation."""
+    self._key, unroll_key = jax.random.split(self._key)
+
+    t = time.time()
+    eval_state = self._generate_eval_unroll(policy_params, unroll_key)
+    eval_metrics = eval_state.info['eval_metrics']
+    eval_metrics.active_episodes.block_until_ready()
+    epoch_eval_time = time.time() - t
+    metrics = {}
+    for fn in [np.mean, np.std]:
+      suffix = '_std' if fn == np.std else ''
+      metrics.update({
+          f'eval/exploratory_episode_{name}{suffix}': (
+              fn(value) if aggregate_episodes else value
+          )
+          for name, value in eval_metrics.episode_metrics.items()
+      })
+    metrics['eval/exploratory_avg_episode_length'] = np.mean(eval_metrics.episode_steps)
+    metrics['eval/exploratory_std_episode_length'] = np.std(eval_metrics.episode_steps)
+    metrics['eval/exploratory_epoch_eval_time'] = epoch_eval_time
+    metrics['eval/exploratory_sps'] = self._steps_per_unroll / epoch_eval_time
+    self._eval_walltime = self._eval_walltime + epoch_eval_time
+    metrics = {
+        'eval/exploratory_walltime': self._eval_walltime,
+        **training_metrics,
+        **metrics,
+    }
+
+    return metrics  # pytype: disable=bad-return-type  # jax-ndarray
